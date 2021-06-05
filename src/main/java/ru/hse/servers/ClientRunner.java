@@ -3,8 +3,6 @@ package ru.hse.servers;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Properties;
 
 import static ru.hse.servers.Constants.*;
 
@@ -18,7 +16,7 @@ public class ClientRunner {
     private final int serverPort;
     private final String clientType;
     private final Server server;
-    private int numberOfThreads;
+    private final int numberOfThreads;
     private final Statistics statistics;
 
     public ClientRunner(
@@ -69,13 +67,12 @@ public class ClientRunner {
     }
 
     public void run() {
-        var list = new ArrayList<Thread>();
         Client client;
         if (clientType.equals(BLOCKING_TYPE)) {
             client = new BlockingClient(numberOfElements, timeBetweenMessagesInMilliseconds,
                     numberOfMessages, serverHost, serverPort, this, statistics);
         } else if (clientType.equals(NON_BLOCKING_TYPE) || clientType.equals(ASYNCHRONOUS_TYPE)) {
-            client = new NonBlockingClient(numberOfElements, timeBetweenMessagesInMilliseconds,
+            client = new NonBlockingAndAsyncClient(numberOfElements, timeBetweenMessagesInMilliseconds,
                     numberOfMessages, serverHost, serverPort, this, statistics);
         } else {
             throw new RuntimeException("Unexpected client type.");
@@ -83,10 +80,10 @@ public class ClientRunner {
         for (var i = 0; i < numberOfClients; i++) {
             var clientThread = new Thread(client::run);
             clientThread.start();
-            list.add(clientThread);
         }
     }
 
+    /* make sure that statistics is calculated only when all treads are running */
     public boolean checkClientsForStatistics() {
         return numberOfClients - finishedClients >= numberOfThreads;
     }

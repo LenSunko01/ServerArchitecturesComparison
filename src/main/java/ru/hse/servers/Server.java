@@ -2,11 +2,10 @@ package ru.hse.servers;
 
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public abstract class Server {
     private final Statistics statistics;
-    private AtomicBoolean calculating = new AtomicBoolean(true);
+    private final AtomicBoolean calculating = new AtomicBoolean(true);
 
     public Server(Statistics statistics) {
         this.statistics = statistics;

@@ -4,6 +4,7 @@ import message.proto.ClientMessage;
 
 import java.io.IOException;
 import java.net.*;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -13,29 +14,36 @@ public class BlockingServer extends Server {
     private final int totalMessages;
     private final int numberOfThreads;
     private final int totalNumberOfClients;
-    private volatile boolean isWorking = true;
     private ExecutorService pool;
     private final ArrayList<ExecutorService> threads = new ArrayList<>();
     private Thread serverThread;
+    private final ArrayList<Socket> clientSockets = new ArrayList<>();
 
     @Override
     public void stop() {
-        isWorking = false;
         pool.shutdown();
         for (var thread : threads) {
             thread.shutdown();
         }
-        serverThread.interrupt();
+        for (var clientSocket : clientSockets) {
+            try {
+                clientSocket.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     private class TaskExecutor implements Runnable {
         private final ClientMessage message;
         private final Socket socket;
         private final ExecutorService threadOut;
-        public TaskExecutor(ClientMessage message, Socket socket, ExecutorService threadOut) {
+        private final int messageOrder;
+        public TaskExecutor(ClientMessage message, Socket socket, ExecutorService threadOut, int messageOrder) {
             this.message = message;
             this.socket = socket;
             this.threadOut = threadOut;
+            this.messageOrder = messageOrder;
         }
 
         @Override
@@ -49,6 +57,7 @@ public class BlockingServer extends Server {
                         .addAllElements(result).build();
                 try {
                     var os = socket.getOutputStream();
+                    os.write(ByteBuffer.allocate(4).putInt(messageOrder).array());
                     replyMessage.writeDelimitedTo(os);
                     os.flush();
                 } catch (IOException e) {
@@ -73,9 +82,9 @@ public class BlockingServer extends Server {
             try {
                 var is = socket.getInputStream();
                 for (var i = 0; i < totalMessages; i++) {
-                    is.readNBytes(4);
+                    var messageOrder = ByteBuffer.wrap(is.readNBytes(4)).getInt();
                     var message = ClientMessage.parseDelimitedFrom(is);
-                    pool.submit(new TaskExecutor(message, socket, threadOut));
+                    pool.submit(new TaskExecutor(message, socket, threadOut, messageOrder));
                 }
             } catch (IOException e) {
                 e.printStackTrace();
@@ -102,8 +111,9 @@ public class BlockingServer extends Server {
                 pool = Executors.newFixedThreadPool(numberOfThreads);
                 for (var i = 0; i < totalNumberOfClients; i++) {
                     var socket = s.accept();
-                    var serverThread = new Thread(new ThreadReader(socket, totalMessages));
-                    serverThread.start();
+                    clientSockets.add(socket);
+                    var clientThread = new Thread(new ThreadReader(socket, totalMessages));
+                    clientThread.start();
                 }
             } catch (IOException e) {
                 e.printStackTrace();

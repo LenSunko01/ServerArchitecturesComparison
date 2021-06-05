@@ -11,54 +11,81 @@ import java.nio.channels.*;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class AsynchronousServer extends Server {
     private final int port;
-    private final ConcurrentHashMap<SocketAddress, ByteArrayOutputStream> clientBytes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<SocketAddress, ByteArrayOutputStream> clientBytesInput = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<AsynchronousSocketChannel, ConcurrentLinkedQueue<ByteBuffer>> clientBytesOutput = new ConcurrentHashMap<>();
     private final ExecutorService pool;
-    private final AtomicInteger messagesSent = new AtomicInteger();
-    private final int expectedNumberOfMessages;
+    private final int numberOfClients;
     private AsynchronousServerSocketChannel serverSocket;
     private Thread serverThread;
+    private final AtomicInteger numberOfClientAccepted = new AtomicInteger(0);
+    private final ArrayList<AsynchronousSocketChannel> clientChannels = new ArrayList<>();
 
     public AsynchronousServer(
             int port,
-            int numberOfMessagesFromClient,
             int numberOfThreads,
             int numberOfClients,
             Statistics statistics) {
         super(statistics);
         this.port = port;
-        expectedNumberOfMessages = numberOfClients * numberOfMessagesFromClient;
         pool = Executors.newFixedThreadPool(numberOfThreads);
-        messagesSent.set(0);
+        this.numberOfClients = numberOfClients;
     }
 
     public void stop() {
         pool.shutdown();
+        for (var clientChannel : clientChannels) {
+            try {
+                clientChannel.shutdownInput();
+                clientChannel.shutdownOutput();
+                clientChannel.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
         try {
             serverSocket.close();
-            serverThread.interrupt();
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
+
     private void writeMessageToClient(
             AsynchronousSocketChannel socketChannel,
             final ByteBuffer buf
     ) {
-        socketChannel.write(buf, socketChannel, new CompletionHandler<>() {
-            @Override
-            public void completed(Integer result, AsynchronousSocketChannel channel) { }
+        synchronized(clientBytesOutput.get(socketChannel)) {
+            var queue = clientBytesOutput.get(socketChannel);
+            if (queue.isEmpty()) {
+                queue.add(buf);
+                socketChannel.write(queue.peek(), socketChannel, new CompletionHandler<>() {
+                    @Override
+                    public void completed(Integer result, AsynchronousSocketChannel channel) {
+                        synchronized(clientBytesOutput.get(socketChannel)) {
+                            if (!queue.isEmpty() && queue.peek().remaining() == 0) {
+                                queue.poll();
+                            }
+                            if (!queue.isEmpty()) {
+                                socketChannel.write(queue.peek(), socketChannel, this);
+                            }
+                        }
+                    }
 
-            @Override
-            public void failed(Throwable e, AsynchronousSocketChannel channel) {
-                e.printStackTrace();
+                    @Override
+                    public void failed(Throwable e, AsynchronousSocketChannel channel) {
+                        e.printStackTrace();
+                    }
+                });
+            } else {
+                queue.add(buf);
             }
-        });
+        }
     }
 
     private void readMessageFromClient(AsynchronousSocketChannel socketChannel) {
@@ -71,21 +98,23 @@ public class AsynchronousServer extends Server {
                         return;
                     }
                     SocketAddress clientAddress = socketChannel.getRemoteAddress();
-                    if (!clientBytes.containsKey(clientAddress)) {
-                        clientBytes.put(clientAddress, new ByteArrayOutputStream());
+                    if (!clientBytesInput.containsKey(clientAddress)) {
+                        clientBytesInput.put(clientAddress, new ByteArrayOutputStream());
                     }
-                    clientBytes.get(clientAddress).write(buffer.array(), 0, readByteNumber);
+                    clientBytesInput.get(clientAddress).write(buffer.array(), 0, readByteNumber);
 
-                    var currentBytes = clientBytes.get(clientAddress);
-                    if (currentBytes.size() >= 4) {
+                    var currentBytes = clientBytesInput.get(clientAddress);
+                    if (currentBytes.size() >= 8) {
                         var intBuffer = currentBytes.toByteArray();
                         var sizeBytes = Arrays.copyOfRange(intBuffer, 0, 4);
                         var size = ByteBuffer.wrap(sizeBytes).getInt();
-                        if (currentBytes.size() >= 4 + size) {
-                            var message = ClientMessage.parseFrom(Arrays.copyOfRange(intBuffer, 4, 4 + size));
+                        var messageOrderBytes = Arrays.copyOfRange(intBuffer, 4, 8);
+                        var messageOrder = ByteBuffer.wrap(messageOrderBytes).getInt();
+                        if (currentBytes.size() >= 8 + size) {
+                            var message = ClientMessage.parseFrom(Arrays.copyOfRange(intBuffer, 8, 8 + size));
                             var newByteArray = new ByteArrayOutputStream();
-                            newByteArray.write(Arrays.copyOfRange(intBuffer, 4 + size, intBuffer.length));
-                            clientBytes.put(clientAddress, newByteArray);
+                            newByteArray.write(Arrays.copyOfRange(intBuffer, 8 + size, intBuffer.length));
+                            clientBytesInput.put(clientAddress, newByteArray);
 
                             pool.submit(() -> {
                                 var list = message.getElementsList();
@@ -94,8 +123,9 @@ public class AsynchronousServer extends Server {
                                         .newBuilder()
                                         .setN(result.size())
                                         .addAllElements(result).build();
-                                var replyBuffer = ByteBuffer.allocate(4 + replyMessage.getSerializedSize())
+                                var replyBuffer = ByteBuffer.allocate(8 + replyMessage.getSerializedSize())
                                         .putInt(replyMessage.getSerializedSize())
+                                        .putInt(messageOrder)
                                         .put(replyMessage.toByteArray())
                                         .flip();
                                 writeMessageToClient(socketChannel, replyBuffer);
@@ -125,7 +155,11 @@ public class AsynchronousServer extends Server {
                 serverSocket.accept(serverSocket, new CompletionHandler<>() {
                     @Override
                     public void completed(AsynchronousSocketChannel socketChannel, AsynchronousServerSocketChannel serverSocket) {
-                        serverSocket.accept(serverSocket, this);
+                        clientChannels.add(socketChannel);
+                        clientBytesOutput.put(socketChannel, new ConcurrentLinkedQueue<>());
+                        if (numberOfClients > numberOfClientAccepted.incrementAndGet()) {
+                            serverSocket.accept(serverSocket, this);
+                        }
                         readMessageFromClient(socketChannel);
                     }
 
@@ -135,6 +169,11 @@ public class AsynchronousServer extends Server {
                     }
                 });
             } catch (IOException e) {
+                try {
+                    serverSocket.close();
+                } catch (IOException exc) {
+                    exc.printStackTrace();
+                }
                 e.printStackTrace();
             }
         });

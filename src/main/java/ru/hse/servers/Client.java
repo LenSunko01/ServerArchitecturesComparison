@@ -1,6 +1,5 @@
 package ru.hse.servers;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -29,7 +28,6 @@ public abstract class Client {
                 .collect(Collectors.toList())
                 .equals(actualList);
     }
-
 
     public Client(
             int numberOfElements,

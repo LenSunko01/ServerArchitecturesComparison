@@ -3,20 +3,22 @@ package ru.hse.servers;
 import com.google.protobuf.InvalidProtocolBufferException;
 import message.proto.ClientMessage;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class NonBlockingServer extends Server {
     private final int port;
     private volatile boolean isWorking = true;
-    private Thread serverThread;
 
     public NonBlockingServer(
             int port,
@@ -31,14 +33,14 @@ public class NonBlockingServer extends Server {
     private final ExecutorService serverInputClientService = Executors.newSingleThreadExecutor();
     private final ExecutorService taskPool;
 
-    private final ConcurrentHashMap<SocketChannel, ByteBuffer> readyRequests = new ConcurrentHashMap<>();
-
+    private final ConcurrentHashMap<SocketChannel, ClientData> readyRequests = new ConcurrentHashMap<>();
+    private final ArrayList<SocketChannel> clientsSockets = new ArrayList<>();
     private Selector selectorInput;
     private Selector selectorOutput;
     private ServerSocketChannel channel;
 
     public void start() {
-        serverThread = new Thread(() -> {
+        Thread serverThread = new Thread(() -> {
             try {
                 selectorInput = Selector.open();
                 selectorOutput = Selector.open();
@@ -60,9 +62,11 @@ public class NonBlockingServer extends Server {
 
     private class ClientData {
         private final SocketChannel clientChannel;
-        private final ByteBuffer sizeBuffer = ByteBuffer.allocate(4);
+        private final ByteBuffer headerBuffer = ByteBuffer.allocate(8);
         private ByteBuffer currentMessageBytes = null;
-        private ByteBuffer replyMessageBytes = null;
+        private int currentMessageOrder;
+        private final ConcurrentLinkedQueue<ByteBuffer> messages = new ConcurrentLinkedQueue<>();
+
 
         private ClientData(SocketChannel clientChannel) {
             this.clientChannel = clientChannel;
@@ -78,32 +82,21 @@ public class NonBlockingServer extends Server {
         public void processMessage() {
             try {
                 var message = ClientMessage.parseFrom(currentMessageBytes.array());
+                var order = currentMessageOrder;
                 currentMessageBytes = null;
                 taskPool.submit(() -> {
                     var list = message.getElementsList();
                     var result = bubbleSort(new ArrayList<>(list));
                     var replyMessage = ClientMessage
-
                             .newBuilder()
                             .setN(result.size())
                             .addAllElements(result).build();
-                    var replyMessageBytes = ByteBuffer.allocate(4 + replyMessage.getSerializedSize());
-                    replyMessageBytes.putInt(replyMessage.getSerializedSize());
-                    replyMessageBytes.put(replyMessage.toByteArray()).flip();
-                    readyRequests.compute(clientChannel, (key, prevVal) -> {
-                        if (prevVal == null) {
-                            return replyMessageBytes;
-                        } else {
-                            ByteArrayOutputStream output = new ByteArrayOutputStream();
-                            try {
-                                output.write(prevVal.array());
-                                output.write(replyMessageBytes.array());
-                            } catch (IOException e) {
-                                e.printStackTrace();
-                            }
-                            return ByteBuffer.wrap(output.toByteArray());
-                        }
-                    });
+                    var replyMessageBytes = ByteBuffer.allocate(8 + replyMessage.getSerializedSize())
+                            .putInt(replyMessage.getSerializedSize())
+                            .putInt(order)
+                            .put(replyMessage.toByteArray()).flip();
+                    messages.add(replyMessageBytes);
+                    readyRequests.putIfAbsent(clientChannel, this);
                     selectorOutput.wakeup();
                 });
             } catch (InvalidProtocolBufferException e) {
@@ -117,12 +110,19 @@ public class NonBlockingServer extends Server {
                     clientChannel.read(currentMessageBytes);
                     return;
                 }
-                clientChannel.read(sizeBuffer);
-                if (sizeBuffer.position() == 4) {
-                    byte[] tmpByteArray = sizeBuffer.array();
-                    var size = ByteBuffer.wrap(tmpByteArray).getInt();
+                if (!clientChannel.isOpen()) {
+                    return;
+                }
+                clientChannel.read(headerBuffer);
+                if (headerBuffer.position() == 8) {
+                    var intBuffer = headerBuffer.array();
+                    var sizeBytes = Arrays.copyOfRange(intBuffer, 0, 4);
+                    var size = ByteBuffer.wrap(sizeBytes).getInt();
+                    var messageOrderBytes = Arrays.copyOfRange(intBuffer, 4, 8);
+                    currentMessageOrder = ByteBuffer.wrap(messageOrderBytes).getInt();
+
                     currentMessageBytes = ByteBuffer.allocate(size);
-                    sizeBuffer.clear();
+                    headerBuffer.clear();
                 }
             } catch (IOException e) {
                 e.printStackTrace();
@@ -130,10 +130,11 @@ public class NonBlockingServer extends Server {
         }
     }
 
-    private void handleAccept(SelectionKey key) throws IOException {
+    private void handleAccept() throws IOException {
         SocketChannel client = channel.accept();
         client.configureBlocking(false);
         var clientData = new ClientData(client);
+        clientsSockets.add(client);
 
         client.register(selectorInput, SelectionKey.OP_READ, clientData);
     }
@@ -148,7 +149,7 @@ public class NonBlockingServer extends Server {
                 while (it.hasNext()) {
                     SelectionKey key = it.next();
                     if (key.isAcceptable()) {
-                        handleAccept(key);
+                        handleAccept();
                     } else if (key.isReadable()) {
                         var clientData = (ClientData) key.attachment();
                         clientData.readRequest();
@@ -159,8 +160,23 @@ public class NonBlockingServer extends Server {
                     it.remove();
                 }
             }
+            selectorInput.close();
         } catch (IOException e) {
+            try {
+                selectorInput.close();
+            } catch (IOException exc) {
+                exc.printStackTrace();
+            }
             e.printStackTrace();
+        }
+    }
+
+    private void register() throws ClosedChannelException {
+        for (var i = readyRequests.entrySet().iterator(); i.hasNext(); ) {
+            var entry = i.next();
+            var clientChannel = entry.getKey();
+            clientChannel.register(selectorOutput, SelectionKey.OP_WRITE, entry.getValue());
+            i.remove();
         }
     }
 
@@ -168,6 +184,7 @@ public class NonBlockingServer extends Server {
         try {
             while (isWorking) {
                 selectorOutput.select();
+
                 Set<SelectionKey> selectedKeys = selectorOutput.selectedKeys();
                 Iterator<SelectionKey> it = selectedKeys.iterator();
 
@@ -175,30 +192,48 @@ public class NonBlockingServer extends Server {
                     SelectionKey key = it.next();
                     if (key.isWritable()) {
                         var clientChannel = (SocketChannel) key.channel();
-                        var replyMessage = (ByteBuffer) key.attachment();
-                        clientChannel.write(replyMessage);
-                        if (replyMessage.remaining() == 0) {
-                            key.cancel();
+                        var clientData = (ClientData) key.attachment();
+                        var replyMessages = clientData.messages;
+                        clientChannel.write(replyMessages.peek());
+                        if (!replyMessages.isEmpty() && replyMessages.peek().remaining() == 0) {
+                            replyMessages.poll();
+                        }
+                        if (replyMessages.isEmpty()) {
+                            key.interestOps(0);
                         }
                     }
                     it.remove();
                 }
-                for (var i = readyRequests.entrySet().iterator(); i.hasNext();) {
-                    var entry = i.next();
-                    var clientChannel = entry.getKey();
-                    clientChannel.register(selectorOutput, SelectionKey.OP_WRITE, entry.getValue());
-                    i.remove();
-                }
+                register();
             }
+            selectorOutput.close();
         } catch (IOException e) {
+            try {
+                selectorOutput.close();
+            } catch (IOException ioException) {
+                ioException.printStackTrace();
+            }
             e.printStackTrace();
         }
     }
 
     public void stop() {
         isWorking = false;
+        selectorOutput.wakeup();
+        selectorInput.wakeup();
         serverInputClientService.shutdown();
         taskPool.shutdown();
-        serverThread.interrupt();
+        try {
+            channel.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        for (var clientSocket : clientsSockets) {
+            try {
+                clientSocket.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
     }
 }

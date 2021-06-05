@@ -2,82 +2,77 @@ package ru.hse.servers;
 
 import message.proto.ClientMessage;
 
+import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class BlockingClient extends Client {
     private final Statistics statistics;
 
-    public BlockingClient(int numberOfElements, int timeBetweenMessagesInMilliSeconds, int numberOfMessages, String serverHost, int serverPort, ClientRunner clientRunner, Statistics statistics) {
-        super(numberOfElements, timeBetweenMessagesInMilliSeconds, numberOfMessages, serverHost, serverPort, clientRunner);
+    public BlockingClient(
+            int numberOfElements,
+            int timeBetweenMessagesInMilliSeconds,
+            int numberOfMessages,
+            String serverHost,
+            int serverPort,
+            ClientRunner clientRunner,
+            Statistics statistics
+    ) {
+        super(numberOfElements, timeBetweenMessagesInMilliSeconds, numberOfMessages,
+                serverHost, serverPort, clientRunner);
         this.statistics = statistics;
     }
 
     public static class ClientTask extends TimerTask {
-        private final InputStream inputStream;
         private final OutputStream outputStream;
         private final Timer timer;
+        private final AtomicInteger counter = new AtomicInteger(0);
         private final int numberOfMessages;
-        private final Socket socket;
-        private final ClientRunner clientRunner;
-        private int counter;
         private final List<ArrayList<Integer>> list;
-        private final Statistics statistics;
+        private final ConcurrentHashMap<Integer, Long> times;
+        private final AtomicBoolean messageIsSent;
 
         public ClientTask(
-                InputStream inputStream,
                 OutputStream outputStream,
                 List<ArrayList<Integer>> list,
                 Timer timer,
                 int numberOfMessages,
-                Socket socket,
-                ClientRunner clientRunner, Statistics statistics) {
-            this.inputStream = inputStream;
+                ConcurrentHashMap<Integer, Long> times,
+                AtomicBoolean messageIsSent
+        ) {
             this.list = list;
             this.outputStream = outputStream;
             this.timer = timer;
             this.numberOfMessages = numberOfMessages;
-            this.socket = socket;
-            this.clientRunner = clientRunner;
-            this.statistics = statistics;
-            counter = 0;
+            this.times = times;
+            this.messageIsSent = messageIsSent;
         }
+
         @Override
         public void run() {
-            if (counter == numberOfMessages) {
+            if (counter.get() == numberOfMessages) {
                 timer.cancel();
-                try {
-                    socket.close();
-                    clientRunner.onClientFinished();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
                 return;
             }
-            counter++;
+            var currentMessage = counter.incrementAndGet();
             var requestMessage = ClientMessage
                     .newBuilder()
                     .setN(list.size())
-                    .addAllElements(list.get(counter - 1)).build();
+                    .addAllElements(list.get(currentMessage - 1)).build();
             try {
+                while (!messageIsSent.compareAndSet(true, false)) ;
                 var startTime = System.nanoTime();
-
-                outputStream.write(ByteBuffer.allocate(4).putInt(requestMessage.getSerializedSize()).array());
-                requestMessage.writeDelimitedTo(outputStream);
-                var message = ClientMessage.parseDelimitedFrom(inputStream);
-
-                var finishTime = System.nanoTime();
-                if (clientRunner.checkClientsForStatistics()) {
-                    statistics.addClientTime((finishTime - startTime) / 1000000.0);
-                }
-
-                if (!checkIsSorted(list.get(counter - 1), message.getElementsList())) {
-                    throw new RuntimeException("Wrong result from server");
-                }
+                times.put(currentMessage, startTime);
+                var dataStream = new DataOutputStream(outputStream);
+                dataStream.writeInt(currentMessage);
+                requestMessage.writeDelimitedTo(dataStream);
+                messageIsSent.set(true);
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -89,12 +84,30 @@ public class BlockingClient extends Client {
         for (var i = 0; i < numberOfMessages; i++) {
             list.add(generateArray(numberOfElements));
         }
-        try {
-            var s = new Socket(serverHost, serverPort);
+        try (Socket s = new Socket(serverHost, serverPort)) {
             var is = s.getInputStream();
             var os = s.getOutputStream();
             var timer = new Timer();
-            timer.scheduleAtFixedRate(new ClientTask(is, os, list, timer, numberOfMessages, s, clientRunner, statistics), 0, timeBetweenMessagesInMilliSeconds);
+            var times = new ConcurrentHashMap<Integer, Long>();
+            var messageIsSent = new AtomicBoolean(true);
+            timer.scheduleAtFixedRate(new ClientTask(os, list, timer, numberOfMessages,
+                    times, messageIsSent), 0, timeBetweenMessagesInMilliSeconds);
+            int numberOfMessagesParsed = 0;
+            while (numberOfMessagesParsed < numberOfMessages) {
+                var messageOrder = ByteBuffer.wrap(is.readNBytes(4)).getInt();
+                var message = ClientMessage.parseDelimitedFrom(is);
+
+                var finishTime = System.nanoTime();
+                if (clientRunner.checkClientsForStatistics()) {
+                    statistics.addClientTime((finishTime - times.get(messageOrder)) / 1000000.0);
+                }
+
+                if (!checkIsSorted(list.get(messageOrder - 1), message.getElementsList())) {
+                    throw new RuntimeException("Wrong result from server");
+                }
+                numberOfMessagesParsed++;
+            }
+            clientRunner.onClientFinished();
         } catch (IOException e) {
             e.printStackTrace();
         }
